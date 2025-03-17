@@ -61,6 +61,9 @@ contract CreditManagerMock {
     /// @notice Maps 3rd party contracts to their respective adapters
     mapping(address => address) public contractToAdapter;
 
+    /// @notice Maps tokens to their liquidation thresholds
+    mapping(address => uint16) public liquidationThresholds;
+
     uint256 return_remainingFunds;
     uint256 return_loss;
 
@@ -212,6 +215,10 @@ contract CreditManagerMock {
     }
 
     function execute(bytes calldata data) external returns (bytes memory) {}
+
+    function setLiquidationThresholds(address token, uint16 lt) external {
+        liquidationThresholds[token] = lt;
+    }
 
     /// FLAGS
 

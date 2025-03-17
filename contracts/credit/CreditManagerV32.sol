@@ -316,14 +316,20 @@ contract CreditManagerV32 is ICreditManagerV3, SanityCheckTrait, ReentrancyGuard
         returns (uint256 remainingFunds, uint256 loss)
     {
         uint256 amountToPool;
-        uint256 minRemainingFunds;
+        // uint256 minRemainingFunds;
         uint256 profit;
-        (amountToPool, minRemainingFunds, profit, loss) = collateralDebtData.calcLiquidationPayments({
-            liquidationDiscount: isExpired ? liquidationDiscountExpired : liquidationDiscount,
-            feeLiquidation: isExpired ? feeLiquidationExpired : feeLiquidation,
+        // (amountToPool, minRemainingFunds, profit, loss) = collateralDebtData.calcLiquidationPayments({
+        //     liquidationDiscount: isExpired ? liquidationDiscountExpired : liquidationDiscount,
+        //     feeLiquidation: isExpired ? feeLiquidationExpired : feeLiquidation,
+        //     amountWithFeeFn: _amountWithFee,
+        //     amountMinusFeeFn: _amountMinusFee
+        // }); // U:[CM-8]
+
+        (amountToPool, remainingFunds, profit, loss) = collateralDebtData.calcLiquidationPayments({
+            totalFunds: IERC20(underlying).safeBalanceOf(creditAccount),
             amountWithFeeFn: _amountWithFee,
             amountMinusFeeFn: _amountMinusFee
-        }); // U:[CM-8]
+        });
 
         if (collateralDebtData.quotedTokens.length != 0) {
             IPoolQuotaKeeperV3(collateralDebtData._poolQuotaKeeper).removeQuotas({
@@ -338,24 +344,6 @@ contract CreditManagerV32 is ICreditManagerV3, SanityCheckTrait, ReentrancyGuard
             // _safeTransfer({creditAccount: creditAccount, token: underlying, to: pool, amount: amountToPool}); // U:[CM-8]
         }
         _poolRepayCreditAccount(collateralDebtData.debt, profit, loss); // U:[CM-8]
-
-        uint256 underlyingBalance;
-        (remainingFunds, underlyingBalance) =
-            _getRemainingFunds({creditAccount: creditAccount, enabledTokensMask: collateralDebtData.enabledTokensMask}); // U:[CM-8]
-
-        if (remainingFunds < minRemainingFunds) {
-            revert InsufficientRemainingFundsException(); // U:[CM-8]
-        }
-
-        // unchecked {
-        //     uint256 amountToLiquidator = Math.min(remainingFunds - minRemainingFunds, underlyingBalance);
-
-        //     if (amountToLiquidator != 0) {
-        //         _safeTransfer({creditAccount: creditAccount, token: underlying, to: to, amount: amountToLiquidator}); // U:[CM-8]
-
-        //         remainingFunds -= amountToLiquidator; // U:[CM-8]
-        //     }
-        // }
 
         CreditAccountInfo storage currentCreditAccountInfo = creditAccountInfo[creditAccount];
         if (currentCreditAccountInfo.lastDebtUpdate == block.number) {

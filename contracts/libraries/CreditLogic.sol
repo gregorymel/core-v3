@@ -100,6 +100,35 @@ library CreditLogic {
         amountToPool = amountToPoolWithFee; // U:[CL-4]
     }
 
+    function calcLiquidationPayments(
+        CollateralDebtData memory collateralDebtData,
+        uint256 totalFunds,
+        function (uint256) view returns (uint256) amountWithFeeFn,
+        function (uint256) view returns (uint256) amountMinusFeeFn
+    ) internal view returns (uint256 amountToPool, uint256 remainingFunds, uint256 profit, uint256 loss) {
+        amountToPool = calcTotalDebt(collateralDebtData);
+
+        uint256 debtWithInterest = collateralDebtData.debt + collateralDebtData.accruedInterest;
+
+        uint256 amountToPoolWithFee = amountWithFeeFn(amountToPool);
+        unchecked {
+            if (totalFunds > amountToPoolWithFee) {
+                remainingFunds = totalFunds - amountToPoolWithFee;
+            } else {
+                amountToPoolWithFee = totalFunds;
+                amountToPool = amountMinusFeeFn(totalFunds);
+            }
+
+            if (amountToPool >= debtWithInterest) {
+                profit = amountToPool - debtWithInterest;
+            } else {
+                loss = debtWithInterest - amountToPool;
+            }
+        }
+
+        amountToPool = amountToPoolWithFee;
+    }
+
     // --------------------- //
     // LIQUIDATION THRESHOLD //
     // --------------------- //

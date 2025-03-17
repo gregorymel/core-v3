@@ -11,14 +11,29 @@ import {ICreditFacadeV3Multicall} from "../interfaces/ICreditFacadeV3Multicall.s
 import {ICreditFacadeV3Hooks} from "../interfaces/ICreditFacadeV3Hooks.sol";
 import {ManageDebtAction} from "../interfaces/ICreditManagerV3.sol";
 import {CreditFacadeV32} from "./CreditFacadeV32.sol";
+import {CreditLogic} from "../libraries/CreditLogic.sol";
+import {Balance} from "../libraries/BalancesLogic.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@1inch/solidity-utils/contracts/libraries/SafeERC20.sol";
+import {CollateralDebtData} from "../interfaces/ICreditManagerV3.sol";
+import {ILossPolicy} from "../interfaces/base/ILossPolicy.sol";
 import {
     CallerNotCreditAccountOwnerException,
     BalanceLessThanExpectedException,
     ExpectedBalancesAlreadySetException,
     ExpectedBalancesNotSetException,
     ForbiddenTokensException,
-    NotImplementedException
+    NotImplementedException,
+    TokenNotAllowedException,
+    CreditAccountNotLiquidatableWithLossException,
+    InsufficientRemainingFundsException
 } from "../interfaces/IExceptions.sol";
+import {IPriceOracleV3} from "../interfaces/IPriceOracleV3.sol";
+import {ICreditManagerV3} from "../interfaces/ICreditManagerV3.sol";
+import {IPoolQuotaKeeperV3} from "../interfaces/IPoolQuotaKeeperV3.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+
+import {console} from "forge-std/console.sol";
 
 struct MulticallContext {
     address creditAccount;
@@ -27,8 +42,20 @@ struct MulticallContext {
     bytes expectedBalancesPacked;
 }
 
+struct LiquidationContext {
+    address creditAccount;
+    uint256 maxFeeAmount;
+    uint256 minUnderlyingBalance;
+    bool hasBadDebt;
+    bytes collateralDebtDataPacked;
+}
+
 contract CreditFacadeV3_Multicall is CreditFacadeV32, ICreditFacadeV3Multicall, ICreditFacadeV3Hooks {
+    using CreditLogic for CollateralDebtData;
+    using SafeERC20 for IERC20;
+
     bytes32 internal constant MULTICALL_CONTEXT_STORAGE_SLOT = keccak256("credit.facade.v3.multicall.context");
+    bytes32 internal constant LIQUIDATION_CONTEXT_STORAGE_SLOT = keccak256("credit.facade.v3.liquidation.context");
 
     /// @dev Ensures that function caller is `creditAccount` itself
     modifier creditAccountOnly() {
@@ -145,6 +172,13 @@ contract CreditFacadeV3_Multicall is CreditFacadeV32, ICreditFacadeV3Multicall, 
         }
     }
 
+    function _getLiquidationContext() internal pure returns (LiquidationContext storage $context) {
+        bytes32 slot = LIQUIDATION_CONTEXT_STORAGE_SLOT;
+        assembly {
+            $context.slot := slot
+        }
+    }
+
     function _checkBeforeExecution(address creditAccount) internal {
         MulticallContext storage $context = _getMulticallContext();
 
@@ -192,5 +226,108 @@ contract CreditFacadeV3_Multicall is CreditFacadeV32, ICreditFacadeV3Multicall, 
         });
 
         $context.creditAccount = address(0);
+    }
+
+    function onBeforeLiquidation(address creditAccount, address[] calldata tokens, uint256[] calldata values)
+        external
+    {
+        LiquidationContext storage $context = _getLiquidationContext();
+        $context.creditAccount = creditAccount;
+
+        (CollateralDebtData memory collateralDebtData, bool isUnhealthy) = _revertIfNotLiquidatable(creditAccount);
+        bool isExpired = !isUnhealthy;
+        bool hasBadDebt = _hasBadDebt(collateralDebtData);
+
+        if (isUnhealthy && hasBadDebt) {
+            ILossPolicy.Params memory params = ILossPolicy.Params({
+                totalDebtUSD: collateralDebtData.totalDebtUSD,
+                twvUSD: collateralDebtData.twvUSD,
+                extraData: "" // lossPolicyData
+            });
+            if (!ILossPolicy(lossPolicy).isLiquidatableWithLoss(creditAccount, msg.sender, params)) {
+                revert CreditAccountNotLiquidatableWithLossException(); // U:[FA-17]
+            }
+            maxDebtPerBlockMultiplier = 0; // U:[FA-17]
+        }
+
+        // address priceOracle = ICreditManagerV3(creditManager).priceOracle();
+        uint256 valueToLiquidateInUnderlying = 0;
+        for (uint256 i; i < tokens.length; i++) {
+            uint256 tokenMask = _getTokenMaskOrRevert(tokens[i]);
+            if (tokenMask & collateralDebtData.enabledTokensMask == 0 || tokens[i] == underlying) {
+                revert TokenNotAllowedException();
+            }
+
+            (uint96 quota,) = IPoolQuotaKeeperV3(collateralDebtData._poolQuotaKeeper).getQuota(creditAccount, tokens[i]);
+            uint16 lt = ICreditManagerV3(creditManager).liquidationThresholds(tokens[i]);
+            uint256 maxValue = quota * PERCENTAGE_FACTOR / lt;
+            if (values[i] > maxValue) {
+                valueToLiquidateInUnderlying += maxValue;
+            } else {
+                valueToLiquidateInUnderlying += values[i];
+            }
+        }
+
+        (
+            ,
+            uint16 feeLiquidation,
+            uint16 liquidationDiscount,
+            uint16 feeLiquidationExpired,
+            uint16 liquidationDiscountExpired
+        ) = ICreditManagerV3(creditManager).fees();
+
+        uint256 amountToLiquidator;
+        uint256 feeAmount;
+        if (isExpired) {
+            amountToLiquidator =
+                valueToLiquidateInUnderlying * (PERCENTAGE_FACTOR - liquidationDiscountExpired) / PERCENTAGE_FACTOR;
+            feeAmount = valueToLiquidateInUnderlying * feeLiquidationExpired / PERCENTAGE_FACTOR;
+        } else {
+            amountToLiquidator =
+                valueToLiquidateInUnderlying * (PERCENTAGE_FACTOR - liquidationDiscount) / PERCENTAGE_FACTOR;
+            feeAmount = valueToLiquidateInUnderlying * feeLiquidation / PERCENTAGE_FACTOR;
+        }
+
+        uint256 underlyingBalance = IERC20(underlying).safeBalanceOf($context.creditAccount);
+
+        $context.hasBadDebt = hasBadDebt;
+        $context.maxFeeAmount = feeAmount;
+        $context.minUnderlyingBalance = underlyingBalance + valueToLiquidateInUnderlying - amountToLiquidator;
+        $context.collateralDebtDataPacked = abi.encode(collateralDebtData);
+    }
+
+    function onAfterLiquidation(address creditAccount) external {
+        LiquidationContext storage $context = _getLiquidationContext();
+        CollateralDebtData memory cdd = abi.decode($context.collateralDebtDataPacked, (CollateralDebtData));
+        uint256 totalDebt = cdd.calcTotalDebt();
+
+        uint256 underlyingBalanceAfter = IERC20(underlying).safeBalanceOf(creditAccount);
+        if (underlyingBalanceAfter < $context.minUnderlyingBalance) {
+            revert InsufficientRemainingFundsException();
+        }
+
+        uint256 feeAmount;
+        // TODO: add _amountWithFee / _amountMinusFee
+        if (underlyingBalanceAfter < totalDebt && !$context.hasBadDebt) {
+            console.log("underlyingBalanceAfter < totalDebt");
+            uint256 amountToPool =
+                Math.min(underlyingBalanceAfter - $context.maxFeeAmount, totalDebt - debtLimits.minDebt);
+            feeAmount = $context.maxFeeAmount;
+            _manageDebt(creditAccount, amountToPool, cdd.enabledTokensMask, ManageDebtAction.DECREASE_DEBT);
+            _fullCollateralCheck({
+                creditAccount: creditAccount,
+                enabledTokensMask: cdd.enabledTokensMask,
+                collateralHints: new uint256[](0),
+                minHealthFactor: PERCENTAGE_FACTOR,
+                useSafePrices: false
+            });
+        } else {
+            (uint256 remainingFunds,) =
+                ICreditManagerV3(creditManager).liquidateCreditAccount(creditAccount, cdd, address(0), false);
+
+            feeAmount = Math.min(remainingFunds, $context.maxFeeAmount);
+        }
+
+        //TODO: transfer feeAmount to treasury
     }
 }

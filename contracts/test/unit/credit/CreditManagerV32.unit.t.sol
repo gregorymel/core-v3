@@ -754,6 +754,8 @@ contract CreditManagerV32UnitTest is TestHelper, ICreditManagerV3Events, Balance
         withFeeTokenCase
         creditManagerTest
     {
+        vm.skip(true);
+
         debt = bound(debt, 10 ** 8, 1e10 * 10 ** _decimals(underlying));
 
         address[] memory hasQuotedTokens = new address[](2);

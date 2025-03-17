@@ -9,6 +9,7 @@ import {CreditManagerMock} from "../../mocks/credit/CreditManagerMock.sol";
 import {ManageDebtAction, CollateralDebtData} from "../../../interfaces/ICreditManagerV3.sol";
 import {BalanceWithMask} from "../../../libraries/BalancesLogic.sol";
 import {RevertReasonForwarder} from "@1inch/solidity-utils/contracts/libraries/RevertReasonForwarder.sol";
+import {LiquidationContext} from "../../../credit/CreditFacadeV3_Multicall.sol";
 import {Vm} from "forge-std/Vm.sol";
 
 contract CreditFacadeV32Harness is CreditFacadeV3_Multicall {
@@ -92,5 +93,20 @@ contract CreditFacadeV32Harness is CreditFacadeV3_Multicall {
 
     function isExpiredInt() external view returns (bool) {
         return _isExpired();
+    }
+
+    // context
+
+    function setLiquidationContext(LiquidationContext memory context) external {
+        LiquidationContext storage $context = _getLiquidationContext();
+        $context.creditAccount = context.creditAccount;
+        $context.maxFeeAmount = context.maxFeeAmount;
+        $context.minUnderlyingBalance = context.minUnderlyingBalance;
+        $context.collateralDebtDataPacked = context.collateralDebtDataPacked;
+        $context.hasBadDebt = context.hasBadDebt;
+    }
+
+    function getLiquidationContext() external view returns (LiquidationContext memory) {
+        return _getLiquidationContext();
     }
 }
