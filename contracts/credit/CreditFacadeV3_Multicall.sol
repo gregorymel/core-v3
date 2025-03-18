@@ -57,15 +57,29 @@ contract CreditFacadeV3_Multicall is CreditFacadeV32, ICreditFacadeV3Multicall, 
     bytes32 internal constant MULTICALL_CONTEXT_STORAGE_SLOT = keccak256("credit.facade.v3.multicall.context");
     bytes32 internal constant LIQUIDATION_CONTEXT_STORAGE_SLOT = keccak256("credit.facade.v3.liquidation.context");
 
+    modifier nonReentrantExecution() {
+        if (_getMulticallContext().creditAccount != address(0)) revert("Reentrant execution");
+        _;
+    }
+
+    modifier nonReentrantLiquidation() {
+        if (_getLiquidationContext().creditAccount != address(0)) revert("Reentrant liquidation");
+        _;
+    }
+
     /// @dev Ensures that function caller is `creditAccount` itself
     modifier creditAccountOnly() {
         _checkCreditAccountOwner(msg.sender);
         _;
     }
 
-    modifier whenExecuting() {
-        address creditAccount = _getMulticallContext().creditAccount;
-        if (creditAccount != msg.sender) revert CallerNotCreditAccountOwnerException();
+    modifier onlyActiveCreditAccount() {
+        if (_getMulticallContext().creditAccount != msg.sender) revert CallerNotCreditAccountOwnerException();
+        _;
+    }
+
+    modifier onlyActiveCreditAccountOnLiquidation() {
+        if (_getLiquidationContext().creditAccount != msg.sender) revert CallerNotCreditAccountOwnerException();
         _;
     }
 
@@ -79,19 +93,19 @@ contract CreditFacadeV3_Multicall is CreditFacadeV32, ICreditFacadeV3Multicall, 
         bool _expirable
     ) CreditFacadeV32(_addressProvider, _creditManager, _lossPolicy, _botList, _weth, _degenNFT, _expirable) {}
 
-    function onBeforeExecution() external override creditAccountOnly {
+    function onBeforeExecution() external override nonReentrantExecution creditAccountOnly {
         _checkBeforeExecution(msg.sender);
     }
 
-    function onAfterExecution() external override whenExecuting {
+    function onAfterExecution() external override onlyActiveCreditAccount {
         _checkAfterExecution(msg.sender);
     }
 
-    function onDemandPriceUpdates(PriceUpdate[] calldata /*updates*/ ) external override whenExecuting {
+    function onDemandPriceUpdates(PriceUpdate[] calldata /*updates*/ ) external override onlyActiveCreditAccount {
         _onDemandPriceUpdates(msg.data[4:]);
     }
 
-    function storeExpectedBalances(BalanceDelta[] calldata balanceDeltas) external override whenExecuting {
+    function storeExpectedBalances(BalanceDelta[] calldata balanceDeltas) external override onlyActiveCreditAccount {
         MulticallContext storage $context = _getMulticallContext();
         address creditAccount = $context.creditAccount;
 
@@ -99,7 +113,7 @@ contract CreditFacadeV3_Multicall is CreditFacadeV32, ICreditFacadeV3Multicall, 
         $context.expectedBalancesPacked = abi.encode(BalancesLogic.storeBalances(creditAccount, balanceDeltas));
     }
 
-    function compareBalances() external override whenExecuting {
+    function compareBalances() external override onlyActiveCreditAccount {
         address creditAccount = msg.sender;
         MulticallContext storage $context = _getMulticallContext();
 
@@ -114,7 +128,7 @@ contract CreditFacadeV3_Multicall is CreditFacadeV32, ICreditFacadeV3Multicall, 
     function updateQuota(address, /*token*/ int96, /*quotaChange*/ uint96 /*minQuota*/ )
         external
         override
-        whenExecuting
+        onlyActiveCreditAccount
     {
         MulticallContext storage $context = _getMulticallContext();
 
@@ -123,12 +137,12 @@ contract CreditFacadeV3_Multicall is CreditFacadeV32, ICreditFacadeV3Multicall, 
             _updateQuota($context.creditAccount, msg.data[4:], $context.enabledTokensMask, type(uint256).max);
     }
 
-    function increaseDebt(uint256 amount) external override whenExecuting {
+    function increaseDebt(uint256 amount) external override onlyActiveCreditAccount {
         MulticallContext storage $context = _getMulticallContext();
         _manageDebt(msg.sender, amount, $context.enabledTokensMask, ManageDebtAction.INCREASE_DEBT); // U:[FA-27]
     }
 
-    function decreaseDebt(uint256 amount) external override whenExecuting {
+    function decreaseDebt(uint256 amount) external override onlyActiveCreditAccount {
         MulticallContext storage $context = _getMulticallContext();
         _manageDebt(msg.sender, amount, $context.enabledTokensMask, ManageDebtAction.DECREASE_DEBT); // U:[FA-31]
     }
@@ -155,7 +169,7 @@ contract CreditFacadeV3_Multicall is CreditFacadeV32, ICreditFacadeV3Multicall, 
     function setFullCheckParams(uint256[] calldata collateralHints, uint16 minHealthFactor)
         external
         override
-        whenExecuting
+        onlyActiveCreditAccount
     {
         MulticallContext storage $context = _getMulticallContext();
 
@@ -230,6 +244,8 @@ contract CreditFacadeV3_Multicall is CreditFacadeV32, ICreditFacadeV3Multicall, 
 
     function onBeforeLiquidation(address creditAccount, address[] calldata tokens, uint256[] calldata values)
         external
+        nonReentrantLiquidation
+        creditAccountOnly
     {
         LiquidationContext storage $context = _getLiquidationContext();
         $context.creditAccount = creditAccount;
@@ -296,7 +312,7 @@ contract CreditFacadeV3_Multicall is CreditFacadeV32, ICreditFacadeV3Multicall, 
         $context.collateralDebtDataPacked = abi.encode(collateralDebtData);
     }
 
-    function onAfterLiquidation(address creditAccount) external {
+    function onAfterLiquidation(address creditAccount) external onlyActiveCreditAccountOnLiquidation {
         LiquidationContext storage $context = _getLiquidationContext();
         CollateralDebtData memory cdd = abi.decode($context.collateralDebtDataPacked, (CollateralDebtData));
         uint256 totalDebt = cdd.calcTotalDebt();
@@ -309,7 +325,6 @@ contract CreditFacadeV3_Multicall is CreditFacadeV32, ICreditFacadeV3Multicall, 
         uint256 feeAmount;
         // TODO: add _amountWithFee / _amountMinusFee
         if (underlyingBalanceAfter < totalDebt && !$context.hasBadDebt) {
-            console.log("underlyingBalanceAfter < totalDebt");
             uint256 amountToPool =
                 Math.min(underlyingBalanceAfter - $context.maxFeeAmount, totalDebt - debtLimits.minDebt);
             feeAmount = $context.maxFeeAmount;

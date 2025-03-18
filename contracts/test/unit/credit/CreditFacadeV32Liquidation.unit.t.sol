@@ -6,7 +6,9 @@ pragma solidity ^0.8.17;
 // Core imports
 import {TestHelper} from "../../lib/helper.sol";
 import {BalanceHelper} from "../../helpers/BalanceHelper.sol";
-import {DUMB_ADDRESS, DEFAULT_FEE_LIQUIDATION, DEFAULT_LIQUIDATION_PREMIUM} from "../../lib/constants.sol";
+import {
+    DUMB_ADDRESS, DUMB_ADDRESS2, DEFAULT_FEE_LIQUIDATION, DEFAULT_LIQUIDATION_PREMIUM
+} from "../../lib/constants.sol";
 import {PERCENTAGE_FACTOR} from "../../../libraries/Constants.sol";
 import "@gearbox-protocol/sdk-gov/contracts/Tokens.sol";
 
@@ -14,6 +16,11 @@ import "@gearbox-protocol/sdk-gov/contracts/Tokens.sol";
 import {ICreditFacadeV3Events} from "../../../interfaces/ICreditFacadeV3.sol";
 import {ICreditManagerV3, CollateralDebtData, ManageDebtAction} from "../../../interfaces/ICreditManagerV3.sol";
 import {AP_BOT_LIST, AP_PRICE_ORACLE} from "../../interfaces/IAddressProviderV3.sol";
+import {
+    InsufficientRemainingFundsException,
+    TokenNotAllowedException,
+    CallerNotCreditAccountOwnerException
+} from "../../../interfaces/IExceptions.sol";
 
 // Contract implementations
 import {CreditFacadeV32Harness} from "./CreditFacadeV32Harness.sol";
@@ -75,24 +82,46 @@ contract CreditFacadeV32LiquidationUnitTest is TestHelper, BalanceHelper, ICredi
         creditManagerMock.setPriceOracle(address(priceOracleMock));
     }
 
-    // onBeforeLiquidation
+    function test_onBeforeLiquidation_reverts_if_called_by_non_credit_account() public {
+        address creditAccount = DUMB_ADDRESS;
+        creditManagerMock.setBorrower(creditAccount);
 
-    // function test_onBeforeLiquidation_reverts_if_credit_account_is_healthy() public {}
-    // function test_onBeforeLiquidation_reverts_for_non_credit_account() public {}
-    // function test_onBeforeLiquidation_reverts_if_token_is_not_enabled() public {}
-    // function test_onBeforeLiquidation_reverts_if_token_is_underlying() public {}
+        vm.prank(DUMB_ADDRESS2);
+        vm.expectRevert(CallerNotCreditAccountOwnerException.selector);
+        creditFacade.onBeforeLiquidation(creditAccount, new address[](0), new uint256[](0));
+    }
 
-    function test_onBeforeLiquidation_calculates_correct_liquidation_fees_and_values() public {
-        // unhealthy account
-        // expired account
-        // account with bad debt
+    function test_onBeforeLiquidation_reverts_if_called_reentrantly() public {
+        address creditAccount = DUMB_ADDRESS;
+        creditManagerMock.setBorrower(creditAccount);
+
+        CollateralDebtData memory cdd;
+        cdd.debt = 101;
+        cdd.totalDebtUSD = 101;
+        cdd.twvUSD = 100;
+        cdd.enabledTokensMask = 2;
+        cdd._poolQuotaKeeper = address(poolQuotaKeeperMock);
+        creditManagerMock.setDebtAndCollateralData(cdd);
+
+        vm.prank(creditAccount);
+        creditFacade.onBeforeLiquidation(creditAccount, new address[](0), new uint256[](0));
+
+        vm.prank(creditAccount);
+        vm.expectRevert("Reentrant liquidation");
+        creditFacade.onBeforeLiquidation(creditAccount, new address[](0), new uint256[](0));
+    }
+
+    function test_onBeforeLiquidation_works_as_expected() public {
         address creditAccount = DUMB_ADDRESS;
         creditManagerMock.setBorrower(creditAccount);
 
         address dai = tokenTestSuite.addressOf(TOKEN_DAI);
         address link = tokenTestSuite.addressOf(TOKEN_LINK);
+        address usdc = tokenTestSuite.addressOf(TOKEN_USDC);
 
-        // unhealthy account
+        uint256 snapshot = vm.snapshot();
+
+        // unhealthy account, link collateral, requested less than quota
         {
             uint16 linkLT = 9000;
             creditManagerMock.setLiquidationThresholds(link, linkLT);
@@ -119,18 +148,124 @@ contract CreditFacadeV32LiquidationUnitTest is TestHelper, BalanceHelper, ICredi
             uint256 expectedMinUnderlyingBalance = 0 + 100 - 100 * DEFAULT_LIQUIDATION_PREMIUM / PERCENTAGE_FACTOR;
             uint256 expectedFeeAmount = 100 * DEFAULT_FEE_LIQUIDATION / PERCENTAGE_FACTOR;
 
+            vm.prank(creditAccount);
             creditFacade.onBeforeLiquidation(creditAccount, tokens, values);
 
             LiquidationContext memory context = creditFacade.getLiquidationContext();
             assertEq(context.minUnderlyingBalance, expectedMinUnderlyingBalance);
             assertEq(context.maxFeeAmount, expectedFeeAmount);
+
+            vm.revertTo(snapshot);
+        }
+
+        // unhealthy account, link collateral, requested more than quota
+        {
+            uint16 linkLT = 9000;
+            creditManagerMock.setLiquidationThresholds(link, linkLT);
+            creditManagerMock.addToken(link, 2);
+
+            // set account quotas
+            uint96 linkQuota = 100;
+            poolQuotaKeeperMock.set_accountQuota(linkQuota, 0);
+            // set account balances
+            deal(link, creditAccount, 200);
+            // set requested values
+            address[] memory tokens = new address[](1);
+            tokens[0] = link;
+            uint256[] memory values = new uint256[](1);
+            values[0] = 120;
+            // set debt and collateral data
+            CollateralDebtData memory cdd;
+            cdd.debt = 101;
+            cdd.totalDebtUSD = 101;
+            cdd.twvUSD = 100;
+            cdd.enabledTokensMask = 2;
+            cdd._poolQuotaKeeper = address(poolQuotaKeeperMock);
+            creditManagerMock.setDebtAndCollateralData(cdd);
+
+            uint256 expectedValueToLiquidate = uint256(linkQuota) * PERCENTAGE_FACTOR / linkLT;
+            uint256 expectedMinUnderlyingBalance = 0 + expectedValueToLiquidate
+                - expectedValueToLiquidate * DEFAULT_LIQUIDATION_PREMIUM / PERCENTAGE_FACTOR;
+            uint256 expectedFeeAmount = expectedValueToLiquidate * DEFAULT_FEE_LIQUIDATION / PERCENTAGE_FACTOR;
+
+            vm.prank(creditAccount);
+            creditFacade.onBeforeLiquidation(creditAccount, tokens, values);
+
+            LiquidationContext memory context = creditFacade.getLiquidationContext();
+            assertEq(context.minUnderlyingBalance, expectedMinUnderlyingBalance);
+            assertEq(context.maxFeeAmount, expectedFeeAmount);
+
+            vm.revertTo(snapshot);
+        }
+
+        // unhealthy account, requested underlying
+        {
+            // set requested values
+            address[] memory tokens = new address[](1);
+            tokens[0] = dai;
+            uint256[] memory values = new uint256[](1);
+            values[0] = 100;
+
+            // set debt and collateral data
+            CollateralDebtData memory cdd;
+            cdd.debt = 101;
+            cdd.totalDebtUSD = 101;
+            cdd.twvUSD = 100;
+            cdd.enabledTokensMask = 1;
+            cdd._poolQuotaKeeper = address(poolQuotaKeeperMock);
+            creditManagerMock.setDebtAndCollateralData(cdd);
+
+            vm.expectRevert(TokenNotAllowedException.selector);
+            vm.prank(creditAccount);
+            creditFacade.onBeforeLiquidation(creditAccount, tokens, values);
+
+            vm.revertTo(snapshot);
+        }
+
+        // unhealthy account, requested non-collateral token
+        {
+            creditManagerMock.setLiquidationThresholds(link, 9000);
+            creditManagerMock.addToken(link, 2);
+            creditManagerMock.setLiquidationThresholds(usdc, 9000);
+            creditManagerMock.addToken(usdc, 4);
+
+            // set account quotas
+            uint96 linkQuota = 100;
+            poolQuotaKeeperMock.set_accountQuota(linkQuota, 0);
+            // set account balances
+            deal(link, creditAccount, 200);
+            deal(usdc, creditAccount, 200);
+            // set requested values
+            address[] memory tokens = new address[](2);
+            tokens[0] = link;
+            tokens[1] = usdc;
+            uint256[] memory values = new uint256[](2);
+            values[0] = 120;
+            values[1] = 120;
+            // set debt and collateral data
+            CollateralDebtData memory cdd;
+            cdd.debt = 101;
+            cdd.totalDebtUSD = 101;
+            cdd.twvUSD = 100;
+            cdd.enabledTokensMask = 2; // usdc not enabled
+            cdd._poolQuotaKeeper = address(poolQuotaKeeperMock);
+            creditManagerMock.setDebtAndCollateralData(cdd);
+
+            vm.expectRevert(TokenNotAllowedException.selector);
+            vm.prank(creditAccount);
+            creditFacade.onBeforeLiquidation(creditAccount, tokens, values);
+
+            vm.revertTo(snapshot);
         }
 
         // expired account
+        {}
 
         // requested more than quota
+        {}
 
         // account with bad debt
+        {}
     }
 
     function test_onAfterLiquidation_works_as_expected() public {
@@ -139,7 +274,32 @@ contract CreditFacadeV32LiquidationUnitTest is TestHelper, BalanceHelper, ICredi
         address dai = tokenTestSuite.addressOf(TOKEN_DAI);
         address link = tokenTestSuite.addressOf(TOKEN_LINK);
 
-        // underlying balance less than (valueToLiquidate - amountToLiquidator) after liquidation
+        // underlying balance less than min expected balance after liquidation
+        {
+            CollateralDebtData memory cdd;
+            // total debt = 100
+            cdd.debt = 100;
+            cdd.accruedFees = 0;
+            cdd.accruedInterest = 0;
+            cdd.totalDebtUSD = 100;
+            cdd.enabledTokensMask = 2;
+
+            // underlying balance = 90 (less than min expected balance)
+            deal(dai, creditAccount, 90);
+
+            // context
+            LiquidationContext memory context;
+            context.creditAccount = creditAccount;
+            context.maxFeeAmount = 0;
+            context.minUnderlyingBalance = 100;
+            context.collateralDebtDataPacked = abi.encode(cdd);
+            context.hasBadDebt = false;
+            creditFacade.setLiquidationContext(context);
+
+            vm.expectRevert(InsufficientRemainingFundsException.selector);
+            vm.prank(creditAccount);
+            creditFacade.onAfterLiquidation(creditAccount);
+        }
 
         // underlying balance more than total debt after liquidation
         {
@@ -166,6 +326,7 @@ contract CreditFacadeV32LiquidationUnitTest is TestHelper, BalanceHelper, ICredi
                 address(creditManagerMock),
                 abi.encodeCall(ICreditManagerV3.liquidateCreditAccount, (creditAccount, cdd, address(0), false))
             );
+            vm.prank(creditAccount);
             creditFacade.onAfterLiquidation(creditAccount);
         }
 
@@ -202,6 +363,7 @@ contract CreditFacadeV32LiquidationUnitTest is TestHelper, BalanceHelper, ICredi
                     (creditAccount, 1 | 2, new uint256[](0), PERCENTAGE_FACTOR, false)
                 )
             );
+            vm.prank(creditAccount);
             creditFacade.onAfterLiquidation(creditAccount);
         }
 
@@ -231,6 +393,7 @@ contract CreditFacadeV32LiquidationUnitTest is TestHelper, BalanceHelper, ICredi
                 address(creditManagerMock),
                 abi.encodeCall(ICreditManagerV3.liquidateCreditAccount, (creditAccount, cdd, address(0), false))
             );
+            vm.prank(creditAccount);
             creditFacade.onAfterLiquidation(creditAccount);
         }
     }
